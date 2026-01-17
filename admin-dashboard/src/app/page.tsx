@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { Users, CheckCircle2, XCircle, Send, Loader2, RefreshCw, MessageSquare, Calendar, Github, MessageCircle, Video } from "lucide-react";
+import { useState, useRef } from "react";
+import { Users, CheckCircle2, XCircle, Send, Loader2, RefreshCw, MessageSquare, Calendar, Github, MessageCircle, Video, FileText, X, Copy, Check, Play, Pause, Volume2 } from "lucide-react";
 import ChatSidebar from "@/components/ChatSidebar";
 
 interface Member {
@@ -17,6 +17,13 @@ interface Member {
     owner: string | null;
     repo: string | null;
   } | null;
+}
+
+interface ScriptData {
+  script: string;
+  recapCount: number;
+  date: string;
+  participants: string[];
 }
 
 export default function AdminDashboard() {
@@ -35,6 +42,19 @@ export default function AdminDashboard() {
   const [sendingStandUpToAll, setSendingStandUpToAll] = useState(false);
   const [sentStandUpLinks, setSentStandUpLinks] = useState<Set<string>>(new Set());
   const [isChatOpen, setIsChatOpen] = useState(false);
+
+  // Script generation state
+  const [scriptData, setScriptData] = useState<ScriptData | null>(null);
+  const [generatingScript, setGeneratingScript] = useState(false);
+  const [showScriptModal, setShowScriptModal] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  // Audio playback state
+  const [generatingAudio, setGeneratingAudio] = useState(false);
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [audioError, setAudioError] = useState<string | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
   const fetchMembers = async () => {
     if (searchByChannel && !channelId.trim()) {
@@ -58,7 +78,6 @@ export default function AdminDashboard() {
       // Check if response is actually JSON
       const contentType = response.headers.get("content-type");
       if (!contentType || !contentType.includes("application/json")) {
-        const text = await response.text();
         throw new Error(`Server returned non-JSON response. Please check your environment variables and ensure the API route is working. Status: ${response.status}`);
       }
 
@@ -97,8 +116,9 @@ export default function AdminDashboard() {
       // Reset sent notifications when reloading
       setSentNotifications(new Set());
       setSentStandUpLinks(new Set());
-    } catch (err: any) {
-      setError(err.message || "An error occurred");
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : "An error occurred";
+      setError(errorMessage);
       setMembers([]);
     } finally {
       setLoading(false);
@@ -141,10 +161,11 @@ export default function AdminDashboard() {
         type: "success",
         message: `Notification sent to ${name}!`,
       });
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : "Failed to send notification";
       setNotificationStatus({
         type: "error",
-        message: err.message || "Failed to send notification",
+        message: errorMessage,
       });
     } finally {
       setSendingNotification(null);
@@ -194,7 +215,7 @@ export default function AdminDashboard() {
         } else {
           errorCount++;
         }
-      } catch (err) {
+      } catch {
         errorCount++;
       }
     }
@@ -218,6 +239,108 @@ export default function AdminDashboard() {
     return null;
   };
 
+  // Generate standup script from daily recaps
+  const generateStandupScript = async (): Promise<ScriptData | null> => {
+    setGeneratingScript(true);
+    // Reset audio state when generating new script
+    setAudioUrl(null);
+    setAudioError(null);
+    setIsPlaying(false);
+    
+    try {
+      const today = new Date().toISOString().split("T")[0];
+      
+      const response = await fetch("/api/generate-standup-script", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          teamId: searchByChannel ? null : teamId,
+          channelId: searchByChannel ? channelId : null,
+          date: today,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (data.error && !data.script) {
+        setNotificationStatus({ type: "error", message: data.error });
+        setTimeout(() => setNotificationStatus(null), 5000);
+        return null;
+      }
+
+      if (data.script) {
+        setScriptData(data);
+        return data;
+      }
+      
+      return null;
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : "Failed to generate script";
+      setNotificationStatus({ type: "error", message: errorMessage });
+      setTimeout(() => setNotificationStatus(null), 5000);
+      return null;
+    } finally {
+      setGeneratingScript(false);
+    }
+  };
+
+  // Generate audio from script using ElevenLabs
+  const generateAudio = async () => {
+    if (!scriptData?.script) return;
+
+    setGeneratingAudio(true);
+    setAudioError(null);
+
+    try {
+      const response = await fetch("/api/generate-audio", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          script: scriptData.script,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || "Failed to generate audio");
+      }
+
+      // Get audio blob
+      const audioBlob = await response.blob();
+      const url = URL.createObjectURL(audioBlob);
+      setAudioUrl(url);
+
+      // Auto-play the audio
+      if (audioRef.current) {
+        audioRef.current.src = url;
+        audioRef.current.play();
+        setIsPlaying(true);
+      }
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : "Failed to generate audio";
+      setAudioError(errorMessage);
+    } finally {
+      setGeneratingAudio(false);
+    }
+  };
+
+  // Toggle audio play/pause
+  const togglePlayPause = () => {
+    if (audioRef.current) {
+      if (isPlaying) {
+        audioRef.current.pause();
+        setIsPlaying(false);
+      } else {
+        audioRef.current.play();
+        setIsPlaying(true);
+      }
+    }
+  };
+
   const sendStandUpLink = async (slackUserId: string, name: string) => {
     const meetUrl = getMeetPageUrl();
     if (!meetUrl) {
@@ -230,6 +353,15 @@ export default function AdminDashboard() {
     setNotificationStatus(null);
 
     try {
+      // First, generate the standup script
+      const script = await generateStandupScript();
+      
+      if (script) {
+        // Show the script modal
+        setShowScriptModal(true);
+      }
+
+      // Send the meet link to Slack
       const message = `🎥 Stand Up Meeting\n\nJoin the stand up meeting here: ${meetUrl}`;
       
       const response = await fetch("/api/send-notification", {
@@ -253,18 +385,23 @@ export default function AdminDashboard() {
       // Mark as sent
       setSentStandUpLinks((prev) => new Set(prev).add(slackUserId));
       
-      setNotificationStatus({
-        type: "success",
-        message: `Stand up link sent to ${name}!`,
-      });
-    } catch (err: any) {
+      if (!script) {
+        setNotificationStatus({
+          type: "success",
+          message: `Stand up link sent to ${name}! (No recaps found to generate script)`,
+        });
+      }
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : "Failed to send stand up link";
       setNotificationStatus({
         type: "error",
-        message: err.message || "Failed to send stand up link",
+        message: errorMessage,
       });
     } finally {
       setSendingStandUp(null);
-      setTimeout(() => setNotificationStatus(null), 3000);
+      if (!showScriptModal) {
+        setTimeout(() => setNotificationStatus(null), 3000);
+      }
     }
   };
 
@@ -284,6 +421,14 @@ export default function AdminDashboard() {
 
     setSendingStandUpToAll(true);
     setNotificationStatus(null);
+
+    // First, generate the standup script
+    const script = await generateStandupScript();
+    
+    if (script) {
+      // Show the script modal
+      setShowScriptModal(true);
+    }
 
     let successCount = 0;
     let errorCount = 0;
@@ -312,18 +457,44 @@ export default function AdminDashboard() {
         } else {
           errorCount++;
         }
-      } catch (err) {
+      } catch {
         errorCount++;
       }
     }
 
-    setNotificationStatus({
-      type: successCount > 0 ? "success" : "error",
-      message: `Sent stand up link to ${successCount} member(s)${errorCount > 0 ? `, ${errorCount} failed` : ""}`,
-    });
+    if (!script) {
+      setNotificationStatus({
+        type: successCount > 0 ? "success" : "error",
+        message: `Sent stand up link to ${successCount} member(s)${errorCount > 0 ? `, ${errorCount} failed` : ""} (No recaps found to generate script)`,
+      });
+    }
 
     setSendingStandUpToAll(false);
-    setTimeout(() => setNotificationStatus(null), 5000);
+    if (!showScriptModal) {
+      setTimeout(() => setNotificationStatus(null), 5000);
+    }
+  };
+
+  const copyToClipboard = async () => {
+    if (scriptData?.script) {
+      await navigator.clipboard.writeText(scriptData.script);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  // Cleanup audio URL when modal closes
+  const handleCloseModal = () => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+    }
+    if (audioUrl) {
+      URL.revokeObjectURL(audioUrl);
+    }
+    setShowScriptModal(false);
+    setAudioUrl(null);
+    setIsPlaying(false);
+    setAudioError(null);
   };
 
   const completedCount = members.filter((m) => m.hasCompletedRecap).length;
@@ -332,6 +503,14 @@ export default function AdminDashboard() {
 
   return (
     <main className="min-h-screen bg-gray-50 p-8 text-black">
+      {/* Hidden audio element */}
+      <audio
+        ref={audioRef}
+        onEnded={() => setIsPlaying(false)}
+        onPause={() => setIsPlaying(false)}
+        onPlay={() => setIsPlaying(true)}
+      />
+
       <div className="max-w-6xl mx-auto space-y-8">
         {/* Header */}
         <header className="flex justify-between items-center">
@@ -505,13 +684,13 @@ export default function AdminDashboard() {
               <div className="flex items-center space-x-3">
                 <button
                   onClick={sendStandUpLinkToAll}
-                  disabled={sendingStandUpToAll || !teamId && !channelId}
+                  disabled={sendingStandUpToAll || generatingScript || (!teamId && !channelId)}
                   className="flex items-center space-x-2 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 disabled:opacity-50 transition-colors whitespace-nowrap"
                 >
-                  {sendingStandUpToAll ? (
+                  {sendingStandUpToAll || generatingScript ? (
                     <>
                       <Loader2 className="w-4 h-4 animate-spin" />
-                      <span>Sending Stand Up...</span>
+                      <span>{generatingScript ? "Generating Script..." : "Sending Stand Up..."}</span>
                     </>
                   ) : (
                     <>
@@ -602,14 +781,14 @@ export default function AdminDashboard() {
                     ) : (
                       <button
                         onClick={() => sendStandUpLink(member.slackUserId, member.name)}
-                        disabled={sendingStandUp === member.slackUserId || sendingStandUpToAll || !teamId && !channelId}
+                        disabled={sendingStandUp === member.slackUserId || sendingStandUpToAll || generatingScript || (!teamId && !channelId)}
                         className="flex items-center space-x-2 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 disabled:opacity-50 transition-colors whitespace-nowrap"
-                        title="Send stand up meeting link"
+                        title="Generate script and send stand up meeting link"
                       >
                         {sendingStandUp === member.slackUserId ? (
                           <>
                             <Loader2 className="w-4 h-4 animate-spin" />
-                            <span>Sending...</span>
+                            <span>{generatingScript ? "Generating..." : "Sending..."}</span>
                           </>
                         ) : (
                           <>
@@ -683,7 +862,146 @@ export default function AdminDashboard() {
         teamId={searchByChannel ? undefined : teamId}
         channelId={searchByChannel ? channelId : undefined}
       />
+
+      {/* Script Modal */}
+      {showScriptModal && scriptData && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-2xl max-w-3xl w-full max-h-[85vh] flex flex-col shadow-2xl">
+            {/* Modal Header */}
+            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-gradient-to-br from-green-500 to-emerald-500 rounded-xl flex items-center justify-center">
+                  <FileText className="w-5 h-5 text-white" />
+                </div>
+                <div>
+                  <h2 className="text-gray-900 font-semibold text-lg">Standup Meeting Script</h2>
+                  <p className="text-gray-500 text-sm">
+                    {scriptData.date} • {scriptData.recapCount} recap{scriptData.recapCount !== 1 ? "s" : ""}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={handleCloseModal}
+                className="text-gray-400 hover:text-gray-600 transition-colors p-2 hover:bg-gray-100 rounded-lg"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Participants badges */}
+            <div className="px-6 py-3 border-b border-gray-200 bg-gray-50">
+              <p className="text-xs text-gray-500 mb-2 font-medium">PARTICIPANTS</p>
+              <div className="flex flex-wrap gap-2">
+                {scriptData.participants.map((name, i) => (
+                  <span
+                    key={i}
+                    className="px-3 py-1 bg-white border border-gray-200 text-gray-700 rounded-full text-xs font-medium shadow-sm"
+                  >
+                    {name}
+                  </span>
+                ))}
+              </div>
+            </div>
+
+            {/* Audio Player Section */}
+            <div className="px-6 py-4 border-b border-gray-200 bg-gradient-to-r from-violet-50 to-purple-50">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <Volume2 className="w-5 h-5 text-violet-600" />
+                  <span className="text-sm font-medium text-gray-700">Audio Playback</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  {audioError && (
+                    <span className="text-xs text-red-500 mr-2">{audioError}</span>
+                  )}
+                  {!audioUrl ? (
+                    <button
+                      onClick={generateAudio}
+                      disabled={generatingAudio}
+                      className="flex items-center gap-2 px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white rounded-lg font-medium text-sm transition-colors disabled:opacity-50"
+                    >
+                      {generatingAudio ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          <span>Generating Audio...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Volume2 className="w-4 h-4" />
+                          <span>Generate & Play Audio</span>
+                        </>
+                      )}
+                    </button>
+                  ) : (
+                    <button
+                      onClick={togglePlayPause}
+                      className="flex items-center gap-2 px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white rounded-lg font-medium text-sm transition-colors"
+                    >
+                      {isPlaying ? (
+                        <>
+                          <Pause className="w-4 h-4" />
+                          <span>Pause</span>
+                        </>
+                      ) : (
+                        <>
+                          <Play className="w-4 h-4" />
+                          <span>Play</span>
+                        </>
+                      )}
+                    </button>
+                  )}
+                </div>
+              </div>
+              {isPlaying && (
+                <div className="mt-3 flex items-center gap-2">
+                  <div className="flex-1 h-1 bg-violet-200 rounded-full overflow-hidden">
+                    <div className="h-full bg-violet-600 rounded-full animate-pulse" style={{ width: '30%' }}></div>
+                  </div>
+                  <span className="text-xs text-violet-600 font-medium">Playing...</span>
+                </div>
+              )}
+            </div>
+
+            {/* Script Content */}
+            <div className="flex-1 overflow-y-auto px-6 py-4">
+              <div className="text-gray-700 whitespace-pre-wrap leading-relaxed text-[15px]">
+                {scriptData.script}
+              </div>
+            </div>
+
+            {/* Modal Footer */}
+            <div className="px-6 py-4 border-t border-gray-200 flex justify-between items-center bg-gray-50">
+              <p className="text-xs text-gray-500">
+                Stand up link has been sent to team members via Slack
+              </p>
+              <div className="flex gap-3">
+                <button
+                  onClick={copyToClipboard}
+                  className="flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 rounded-lg font-medium text-sm transition-colors"
+                >
+                  {copied ? (
+                    <>
+                      <Check className="w-4 h-4 text-green-500" />
+                      <span>Copied!</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-4 h-4" />
+                      <span>Copy Script</span>
+                    </>
+                  )}
+                </button>
+                <button
+                  onClick={handleCloseModal}
+                  className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium text-sm transition-colors"
+                >
+                  Done
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }
-

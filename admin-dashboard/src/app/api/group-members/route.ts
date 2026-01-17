@@ -40,7 +40,8 @@ export async function GET(request: NextRequest) {
     if (channelId) {
       console.log("🔍 Fetching members for channel_id:", channelId);
       
-      const backendUrl = process.env.BACKEND_URL || "http://localhost:3000";
+      // Remove trailing slash from backend URL to prevent double-slash issues
+      const backendUrl = (process.env.BACKEND_URL || "http://localhost:3000").replace(/\/+$/, "");
       const response = await fetch(`${backendUrl}/api/channel-members?channel_id=${encodeURIComponent(channelId)}`);
       
       if (!response.ok) {
