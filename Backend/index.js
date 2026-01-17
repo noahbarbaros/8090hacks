@@ -240,6 +240,13 @@ async function fetchUserGitHubCommits(slackUserId, teamId) {
     // Limit to most recently updated repos to avoid too many API calls
     const reposToCheck = repos.slice(0, 20); // Check top 20 most recently updated repos
     
+    // Calculate date range for yesterday and today
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const sinceDate = yesterday.toISOString();
+    
     for (const repo of reposToCheck) {
       try {
         const commitsResponse = await octokit.request("GET /repos/{owner}/{repo}/commits", {
@@ -247,6 +254,7 @@ async function fetchUserGitHubCommits(slackUserId, teamId) {
           repo: repo.name,
           per_page: 10,
           author: userLogin, // Filter by author to get only user's commits
+          since: sinceDate, // Only get commits since yesterday
         });
         
         // Filter commits to ensure only those authored by the user
@@ -257,8 +265,16 @@ async function fetchUserGitHubCommits(slackUserId, teamId) {
           return authorLogin === userLogin || committerLogin === userLogin;
         });
         
+        // Additional filter: only commits from yesterday and today
+        const recentCommits = userCommits.filter((commit) => {
+          const commitDate = new Date(commit.commit.author.date);
+          commitDate.setHours(0, 0, 0, 0);
+          // Check if commit is from today or yesterday
+          return commitDate.getTime() === today.getTime() || commitDate.getTime() === yesterday.getTime();
+        });
+        
         // Add repo info to each commit
-        const commitsWithRepo = userCommits.map(commit => ({
+        const commitsWithRepo = recentCommits.map(commit => ({
           ...commit,
           repo: repo.name,
           owner: repo.owner.login,
@@ -541,16 +557,21 @@ receiver.router.get("/api/google/callback", async (req, res) => {
     }
     
     // Exchange code for tokens via frontend API
+    // Ensure code is a string (it might be an array from query params)
+    const codeString = Array.isArray(code) ? code[0] : code;
+    
     const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3001";
     const exchangeResponse = await fetch(`${frontendUrl}/api/google/exchange-token`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code }),
+      body: JSON.stringify({ code: codeString }),
     });
     
     if (!exchangeResponse.ok) {
       const errorData = await exchangeResponse.json().catch(() => ({}));
-      throw new Error(errorData.error || "Failed to exchange code for tokens");
+      const errorMessage = errorData.error || "Failed to exchange code for tokens";
+      console.error(`❌ Token exchange failed: ${errorMessage}`);
+      throw new Error(errorMessage);
     }
     
     const { tokens, email } = await exchangeResponse.json();
