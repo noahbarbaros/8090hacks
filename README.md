@@ -52,7 +52,7 @@ SLACK_SIGNING_SECRET=your-signing-secret
 SLACK_CHANNEL_ID=your-channel-id
 SUPABASE_URL=your-supabase-url
 SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
-OPENAI_API_KEY=your-openai-api-key
+CEREBRAS_API_KEY=your-cerebras-api-key
 GOOGLE_CLIENT_ID=your-google-client-id
 GOOGLE_CLIENT_SECRET=your-google-client-secret
 GOOGLE_REDIRECT_URI=http://localhost:3000/api/google/callback
@@ -164,6 +164,6 @@ The bot will:
 
 -   **Backend**: Node.js, Slack Bolt, Express
 -   **Database**: Supabase (PostgreSQL)
--   **AI**: OpenAI GPT-4
+-   **AI**: Cerebras AI (Llama 3.3 70B)
 -   **APIs**: GitHub API, Google Calendar API, Slack API
 -   **Frontend** (optional): Next.js, TypeScript, Tailwind CSS

@@ -14,7 +14,8 @@ const supabase = createClient(
 );
 
 const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+  apiKey: process.env.CEREBRAS_API_KEY,
+  baseURL: "https://api.cerebras.ai/v1",
 });
 
 // Create an Express receiver so we can add custom routes
@@ -158,20 +159,22 @@ async function fetchUserCalendarEvents(slackUserId, teamId) {
   }
   
   try {
-    const oauth2Client = createGoogleOAuth2Client();
-    oauth2Client.setCredentials(connection.google_tokens);
-    
-    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-    
-    const res = await calendar.events.list({
-      calendarId: 'primary',
-      timeMin: new Date().toISOString(),
-      maxResults: 10,
-      singleEvents: true,
-      orderBy: 'startTime',
+    // Call frontend API to fetch calendar events (frontend has Google credentials)
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3001";
+    const response = await fetch(`${frontendUrl}/api/google/fetch-events`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tokens: connection.google_tokens }),
     });
     
-    return res.data.items || [];
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      console.error(`❌ Failed to fetch calendar events: ${errorData.error || 'Unknown error'}`);
+      return [];
+    }
+    
+    const { events } = await response.json();
+    return events || [];
   } catch (error) {
     console.error("❌ Error fetching calendar events:", error);
     return [];
@@ -446,7 +449,7 @@ async function loadSummaryFromSupabase(userId, teamId) {
   }
 }
 
-// Summarize commits, Slack messages, and calendar events using OpenAI - returns bullet point format
+// Summarize commits, Slack messages, and calendar events using Cerebras AI - returns bullet point format
 async function summarizeActivity(commits, slackMessages = [], calendarEvents = []) {
   if ((!commits || commits.length === 0) && (!slackMessages || slackMessages.length === 0) && (!calendarEvents || calendarEvents.length === 0)) {
     return null;
@@ -492,7 +495,7 @@ async function summarizeActivity(commits, slackMessages = [], calendarEvents = [
 
   try {
     const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: "llama-3.3-70b",
       messages: [
         {
           role: "system",
@@ -528,7 +531,7 @@ IMPORTANT: Each field MUST be a string. Use 3-5 bullet points per field. Be conc
       plan: String(result.plan || ""),
     };
   } catch (e) {
-    console.error("OpenAI error:", e.message);
+    console.error("Cerebras AI error:", e.message);
     return null;
   }
 }
@@ -1513,6 +1516,115 @@ app.view("recap_submit", async ({ ack, body, view, client }) => {
   });
   
 
+// API endpoint to send notification to a specific user
+receiver.router.post("/api/send-notification", async (req, res) => {
+  try {
+    const { slackUserId, message, teamId } = req.body;
+
+    if (!slackUserId || !message) {
+      return res.status(400).json({ error: "slackUserId and message are required" });
+    }
+
+    // Send DM to the user
+    await app.client.chat.postMessage({
+      channel: slackUserId,
+      text: message,
+    });
+
+    console.log(`✅ Sent notification to ${slackUserId}`);
+    res.json({ success: true, message: "Notification sent successfully" });
+  } catch (e) {
+    console.error("Error in /api/send-notification:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// API endpoint to get channel members with their info
+receiver.router.get("/api/channel-members", async (req, res) => {
+  try {
+    const { channel_id } = req.query;
+
+    if (!channel_id) {
+      return res.status(400).json({ error: "channel_id is required" });
+    }
+
+    // Get channel members
+    const memberIds = await getChannelMembers(channel_id);
+    
+    // Get user info for each member
+    const members = [];
+    for (const userId of memberIds) {
+      try {
+        const userInfo = await app.client.users.info({ user: userId });
+        const user = userInfo.user;
+        members.push({
+          slackUserId: userId,
+          name: user?.real_name || user?.display_name || user?.name || userId,
+          email: user?.profile?.email || null,
+          profileImage: user?.profile?.image_512 || user?.profile?.image_192 || user?.profile?.image_72 || null,
+        });
+      } catch (e) {
+        console.error(`Failed to get info for ${userId}:`, e.message);
+        // Still include the user even if we can't get their info
+        members.push({
+          slackUserId: userId,
+          name: userId,
+          email: null,
+          profileImage: null,
+        });
+      }
+    }
+
+    // Get team_id from channel info
+    let teamId = null;
+    try {
+      const channelInfo = await app.client.conversations.info({ channel: channel_id });
+      teamId = channelInfo.channel?.shared_team_ids?.[0] || null;
+    } catch (e) {
+      console.error("Failed to get channel info:", e.message);
+    }
+
+    res.json({ 
+      members,
+      teamId,
+      channelId: channel_id 
+    });
+  } catch (e) {
+    console.error("Error in /api/channel-members:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// API endpoint to get user profile images by user IDs
+receiver.router.get("/api/user-profile-images", async (req, res) => {
+  try {
+    const { user_ids } = req.query;
+    
+    if (!user_ids) {
+      return res.status(400).json({ error: "user_ids is required (comma-separated)" });
+    }
+
+    const userIds = Array.isArray(user_ids) ? user_ids : user_ids.split(",");
+    const profileImages = {};
+
+    for (const userId of userIds) {
+      try {
+        const userInfo = await app.client.users.info({ user: userId.trim() });
+        const user = userInfo.user;
+        profileImages[userId.trim()] = user?.profile?.image_512 || user?.profile?.image_192 || user?.profile?.image_72 || null;
+      } catch (e) {
+        console.error(`Failed to get profile image for ${userId}:`, e.message);
+        profileImages[userId.trim()] = null;
+      }
+    }
+
+    res.json({ profileImages });
+  } catch (e) {
+    console.error("Error in /api/user-profile-images:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Start once
 (async () => {
   const port = process.env.PORT || 3000;
@@ -1521,6 +1633,9 @@ app.view("recap_submit", async ({ ack, body, view, client }) => {
   console.log(`📡 API endpoints ready:`);
   console.log(`   POST /api/send-prompts - Send prompts to all channel members`);
   console.log(`   POST /api/send-recap - Send recap for a specific user`);
+  console.log(`   POST /api/send-notification - Send notification to a user`);
+  console.log(`   GET  /api/channel-members - Get channel members with info`);
+  console.log(`   GET  /api/user-profile-images - Get user profile images by user IDs`);
   console.log(`   GET  /api/google/callback - Google OAuth callback`);
   console.log(`💬 Slack commands available:`);
   console.log(`   /connect-google - Connect Google Calendar`);
