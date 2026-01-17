@@ -42,48 +42,118 @@ const app = new App({
   receiver,
 });
 
-// In-memory cache for pre-generated AI summaries (userId -> summary)
-const summaryCache = new Map();
+// Helper function to get today's date string in YYYY-MM-DD format (for Supabase queries)
+function getTodayDateString() {
+  const today = new Date();
+  return today.toISOString().split('T')[0];
+}
 
-// Get commits from Supabase for a user
-async function getCommitsFromSupabase(email) {
+// Helper function to save AI-generated summary to Supabase
+async function saveSummaryToSupabase(userId, teamId, summary) {
+  const today = getTodayDateString();
+  
   try {
-    const today = new Date().toISOString().split("T")[0];
-    console.log(`🔍 Looking for commits for ${email} on ${today}`);
+    // Check if a recap already exists for today
+    const { data: existing } = await supabase
+      .from("daily_recaps")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("team_id", teamId)
+      .gte("submitted_at", `${today}T00:00:00Z`)
+      .lt("submitted_at", `${today}T23:59:59Z`)
+      .single();
+
+    const normalizedSummary = normalizeSummary(summary);
     
-    // Try exact email match first
-    let { data, error } = await supabase
-      .from("github_commits")
-      .select("commits, github_username, email")
-      .eq("email", email.toLowerCase())
-      .eq("date", today)
-      .maybeSingle();
+    if (existing) {
+      // Update existing record with AI-generated content
+      const { data, error } = await supabase
+        .from("daily_recaps")
+        .update({
+          progress: normalizedSummary.progress,
+          blockers: normalizedSummary.blockers,
+          plan: normalizedSummary.plan,
+          // Keep notes if they exist, otherwise null
+          notes: existing.notes || null,
+          // Mark as AI-generated draft
+          is_ai_generated: true,
+        })
+        .eq("id", existing.id)
+        .select()
+        .single();
 
-    // If no match, try to find by date only (in case email format differs)
-    if (!data) {
-      const allToday = await supabase
-        .from("github_commits")
-        .select("commits, github_username, email")
-        .eq("date", today);
-      
-      if (allToday.data && allToday.data.length > 0) {
-        console.log(`📋 Available commits in Supabase for today: ${allToday.data.map(d => d.email).join(", ")}`);
+      if (error) {
+        console.error("❌ Failed to update summary in Supabase:", error);
+        return null;
       }
-    }
+      
+      console.log(`✅ Updated AI summary in Supabase for user ${userId} (recap ID: ${data.id})`);
+      return data.id;
+    } else {
+      // Insert new record with AI-generated content
+      const { data, error } = await supabase
+        .from("daily_recaps")
+        .insert({
+          user_id: userId,
+          team_id: teamId,
+          submitted_at: new Date().toISOString(),
+          progress: normalizedSummary.progress,
+          blockers: normalizedSummary.blockers,
+          plan: normalizedSummary.plan,
+          notes: null,
+          is_ai_generated: true,
+        })
+        .select()
+        .single();
 
-    if (error && error.code !== "PGRST116") {
-      console.log(`📭 No commits in Supabase for ${email}: ${error.message}`);
+      if (error) {
+        console.error("❌ Failed to save summary to Supabase:", error);
+        return null;
+      }
+      
+      console.log(`✅ Saved AI summary to Supabase for user ${userId} (recap ID: ${data.id})`);
+      return data.id;
+    }
+  } catch (error) {
+    console.error("❌ Error saving summary to Supabase:", error);
+    return null;
+  }
+}
+
+// Helper function to load summary from Supabase
+async function loadSummaryFromSupabase(userId, teamId) {
+  const today = getTodayDateString();
+  
+  try {
+    const { data, error } = await supabase
+      .from("daily_recaps")
+      .select("progress, blockers, plan, notes, id")
+      .eq("user_id", userId)
+      .eq("team_id", teamId)
+      .gte("submitted_at", `${today}T00:00:00Z`)
+      .lt("submitted_at", `${today}T23:59:59Z`)
+      .order("submitted_at", { ascending: false })
+      .limit(1)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        // No record found - this is fine
+        return null;
+      }
+      console.error("❌ Failed to load summary from Supabase:", error);
       return null;
     }
 
-    if (data) {
-      console.log(`✅ Found ${data.commits?.length || 0} commits for ${data.github_username} (${data.email})`);
-      return data.commits;
-    }
-
-    return null;
-  } catch (e) {
-    console.error("Error fetching commits from Supabase:", e);
+    return {
+      progress: data.progress || "",
+      blockers: data.blockers || "",
+      plan: data.plan || "",
+      notes: data.notes || "",
+      recap_id: data.id, // Store the ID so we can update it later
+    };
+  } catch (error) {
+    console.error("❌ Error loading summary from Supabase:", error);
     return null;
   }
 }
@@ -175,33 +245,37 @@ IMPORTANT: Each field MUST be a string. Use 3-5 bullet points per field. Be conc
   }
 }
 
-// Legacy function for backward compatibility
-async function summarizeCommits(commits) {
-  return summarizeActivity(commits, []);
-}
 
-// API endpoint for frontend to trigger sending prompts to all channel members
-// Accepts optional commits, slackMessages, calendarEvents, and userEmail from frontend for pre-generation
+// API endpoint for frontend to trigger sending prompts to a specific user
+// Accepts optional commits, slackMessages, calendarEvents, and googleEmail from frontend
+// Sends prompt only to the Slack account associated with the Google Calendar email
 receiver.router.post("/api/send-prompts", async (req, res) => {
   try {
-    const { commits, slackMessages, calendarEvents, userEmail } = req.body || {};
-    console.log("📤 Triggering Slack prompts to all channel members...");
+    const { commits, slackMessages, calendarEvents, googleEmail } = req.body || {};
+    console.log("📤 Triggering Slack prompt to specific user...");
     console.log(`📊 Received from frontend: ${commits?.length || 0} commits, ${slackMessages?.length || 0} Slack messages, ${calendarEvents?.length || 0} calendar events`);
+    
+    if (!googleEmail) {
+      return res.status(400).json({ error: "Google email is required. Please connect Google Calendar first." });
+    }
+    
+    // Get Slack user ID from Google email
+    const slackUserId = await getSlackUserIdFromEmail(googleEmail);
+    if (!slackUserId) {
+      return res.status(404).json({ error: `Could not find Slack user for email ${googleEmail}. Make sure the email matches your Slack account.` });
+    }
+    
+    console.log(`✅ Found Slack user ${slackUserId} for email ${googleEmail}`);
     
     // Filter Slack messages to only include those from the user
     let filteredSlackMessages = slackMessages || [];
-    if (userEmail && slackMessages && slackMessages.length > 0) {
-      const slackUserId = await getSlackUserIdFromEmail(userEmail);
-      if (slackUserId) {
-        filteredSlackMessages = slackMessages.filter((msg) => msg.user === slackUserId);
-        console.log(`🔍 Filtered Slack messages: ${slackMessages.length} -> ${filteredSlackMessages.length} (user: ${slackUserId})`);
-      } else {
-        console.log(`⚠️ Could not find Slack user ID for email ${userEmail}, using all messages`);
-      }
+    if (slackMessages && slackMessages.length > 0) {
+      filteredSlackMessages = slackMessages.filter((msg) => msg.user === slackUserId);
+      console.log(`🔍 Filtered Slack messages: ${slackMessages.length} -> ${filteredSlackMessages.length} (user: ${slackUserId})`);
     }
     
-    await sendPromptsNow(commits, filteredSlackMessages, calendarEvents);
-    res.json({ success: true, message: "Prompts sent to all channel members" });
+    await sendPromptsNow(commits, filteredSlackMessages, calendarEvents, slackUserId);
+    res.json({ success: true, message: `Prompt sent to ${googleEmail}` });
   } catch (e) {
     console.error("Error in /api/send-prompts:", e);
     res.status(500).json({ error: e.message });
@@ -211,22 +285,20 @@ receiver.router.post("/api/send-prompts", async (req, res) => {
 // API endpoint for frontend to trigger Slack recap
 receiver.router.post("/api/send-recap", async (req, res) => {
   try {
-    const { email, slackUserId } = req.body;
+    const { email, slackUserId, commits, slackMessages, calendarEvents } = req.body;
 
     if (!email) {
       return res.status(400).json({ error: "Email is required" });
     }
 
-    // Get commits from Supabase
-    const commits = await getCommitsFromSupabase(email);
-    
+    // Get commits from frontend (required)
     if (!commits || commits.length === 0) {
-      return res.status(404).json({ error: "No commits found for today" });
+      return res.status(400).json({ error: "Commits are required from frontend" });
     }
 
     // Generate AI summary
     console.log(`🤖 Generating AI summary for ${commits.length} commits`);
-    const summary = await summarizeCommits(commits);
+    const summary = await summarizeActivity(commits, slackMessages || [], calendarEvents || []);
 
     if (!summary) {
       return res.status(500).json({ error: "Failed to generate AI summary" });
@@ -353,86 +425,102 @@ async function getChannelMembers(channelId) {
   return humanMembers;
 }
 
-async function sendPromptsNow(frontendCommits = null, frontendSlackMessages = null, frontendCalendarEvents = null) {
-  const channelId = process.env.SLACK_CHANNEL_ID;
-
-  if (!channelId) {
-    console.log("No SLACK_CHANNEL_ID set. Skipping DM send.");
-    return;
-  }
-
+async function sendPromptsNow(frontendCommits = null, frontendSlackMessages = null, frontendCalendarEvents = null, targetSlackUserId = null) {
+  // If targetSlackUserId is provided, send only to that user
+  // Otherwise, send to all channel members (legacy behavior)
   let userIds;
-  try {
-    userIds = await getChannelMembers(channelId);
-    console.log(`📋 Found ${userIds.length} users in channel ${channelId}`);
-  } catch (e) {
-    console.error("❌ Failed to fetch channel members:", e.data || e.message);
-    return;
+  
+  if (targetSlackUserId) {
+    // Send only to the specific user
+    userIds = [targetSlackUserId];
+    console.log(`📤 Sending prompt to specific user: ${targetSlackUserId}`);
+  } else {
+    // Legacy: send to all channel members
+    const channelId = process.env.SLACK_CHANNEL_ID;
+    if (!channelId) {
+      console.log("No SLACK_CHANNEL_ID set. Skipping DM send.");
+      return;
+    }
+
+    try {
+      userIds = await getChannelMembers(channelId);
+      console.log(`📋 Found ${userIds.length} users in channel ${channelId}`);
+    } catch (e) {
+      console.error("❌ Failed to fetch channel members:", e.data || e.message);
+      return;
+    }
+
+    if (userIds.length === 0) {
+      console.log("No users found in channel. Skipping DM send.");
+      return;
+    }
   }
 
-  if (userIds.length === 0) {
-    console.log("No users found in channel. Skipping DM send.");
-    return;
-  }
-
-  // Clear old cache entries
-  summaryCache.clear();
-  console.log("🧹 Cleared summary cache");
-
-  // If frontend provided commits, Slack messages, or calendar events, use those for ALL users
+  // If frontend provided commits, Slack messages, or calendar events WITH ACTUAL CONTENT, use those for ALL users
   // This is the "your commits from the dashboard" scenario
-  if (frontendCommits || frontendSlackMessages || frontendCalendarEvents) {
+  // Check if arrays exist AND have content (empty arrays are truthy but have no data)
+  // Handle null, undefined, and empty arrays properly
+  const hasFrontendCommits = Array.isArray(frontendCommits) && frontendCommits.length > 0;
+  const hasFrontendSlackMessages = Array.isArray(frontendSlackMessages) && frontendSlackMessages.length > 0;
+  const hasFrontendCalendarEvents = Array.isArray(frontendCalendarEvents) && frontendCalendarEvents.length > 0;
+  
+  console.log(`🔍 Frontend data check: commits=${hasFrontendCommits} (${frontendCommits?.length || 0}), slack=${hasFrontendSlackMessages} (${frontendSlackMessages?.length || 0}), calendar=${hasFrontendCalendarEvents} (${frontendCalendarEvents?.length || 0})`);
+  
+  if (hasFrontendCommits || hasFrontendSlackMessages || hasFrontendCalendarEvents) {
     console.log("🤖 Using frontend data for summary generation...");
     const commits = frontendCommits || [];
     const slackMsgs = frontendSlackMessages || [];
     const calendarEvts = frontendCalendarEvents || [];
     
-    if (commits.length > 0 || slackMsgs.length > 0 || calendarEvts.length > 0) {
-      console.log(`🤖 Generating summary from ${commits.length} commits + ${slackMsgs.length} Slack messages + ${calendarEvts.length} calendar events`);
-      const summary = await summarizeActivity(commits, slackMsgs, calendarEvts);
-      
-      if (summary) {
-        // Normalize summary before caching
-        const normalizedSummary = normalizeSummary(summary);
-        // Cache the same summary for all users (since it's from the dashboard)
-        for (const userId of userIds) {
-          summaryCache.set(userId, normalizedSummary);
-        }
-        console.log(`✅ Cached normalized summary for all ${userIds.length} users`);
-      }
-    }
-  } else {
-    // Fall back to per-user Supabase lookups
-    console.log("🤖 Pre-generating AI summaries for all users from Supabase...");
-    for (const userId of userIds) {
+    console.log(`🤖 Generating summary from ${commits.length} commits + ${slackMsgs.length} Slack messages + ${calendarEvts.length} calendar events`);
+    const summary = await summarizeActivity(commits, slackMsgs, calendarEvts);
+    
+    if (summary) {
+      // Get team_id from auth context (workspace ID)
+      let teamId = null;
       try {
-        const email = await getSlackUserEmail(userId);
-        if (email) {
-          const commits = await getCommitsFromSupabase(email);
-          if (commits && commits.length > 0) {
-            console.log(`🤖 Generating summary for ${email} (${commits.length} commits)`);
-            const summary = await summarizeActivity(commits, []);
-            if (summary) {
-              // Normalize summary before caching
-              const normalizedSummary = normalizeSummary(summary);
-              summaryCache.set(userId, normalizedSummary);
-              console.log(`✅ Cached normalized summary for ${userId}`);
-            }
-          } else {
-            console.log(`📭 No commits for ${email}, skipping summary`);
-          }
-        }
+        const authResult = await app.client.auth.test();
+        teamId = authResult.team_id || null;
       } catch (e) {
-        console.error(`❌ Failed to pre-generate summary for ${userId}:`, e.message);
+        console.log("⚠️ Could not get team_id from auth, will use null");
       }
+      
+      // Save summaries to Supabase for each user
+      for (const userId of userIds) {
+        try {
+          await saveSummaryToSupabase(userId, teamId, summary);
+        } catch (e) {
+          console.error(`❌ Failed to save summary for user ${userId}:`, e.message);
+        }
+      }
+      console.log(`✅ Saved AI summaries to Supabase for ${userIds.length} user(s)`);
+    } else {
+      console.log("⚠️ No summary generated from frontend data");
     }
   }
-  console.log(`📦 Pre-generated ${summaryCache.size} summaries`);
+  
+  // If no frontend data was provided, we can't generate summaries (commits must come from frontend)
+  if (!hasFrontendCommits && !hasFrontendSlackMessages && !hasFrontendCalendarEvents) {
+    console.log("⚠️ No frontend data provided. Summaries will be generated on-demand when users click the button.");
+    console.log("💡 Frontend should provide commits, Slack messages, or calendar events for pre-generation.");
+  }
+
+  // Get team_id from auth context (workspace ID) - do this once for all users
+  let teamId = null;
+  try {
+    const authResult = await app.client.auth.test();
+    teamId = authResult.team_id || null;
+  } catch (e) {
+    console.log("⚠️ Could not get team_id from auth, will use null");
+  }
 
   // Now send prompts to all users
   for (const user of userIds) {
     try {
-      const hasSummary = summaryCache.has(user);
+      // Check if user has a summary in Supabase for today
+      const existingSummary = await loadSummaryFromSupabase(user, teamId);
+      const hasSummary = !!existingSummary;
+      
       await app.client.chat.postMessage({
         channel: user,
         text: "Daily recap: Want to capture your day?",
@@ -465,7 +553,7 @@ async function sendPromptsNow(frontendCommits = null, frontendSlackMessages = nu
         ],
       });
 
-      console.log(`✅ Sent recap prompt to ${user}${hasSummary ? " (with pre-generated summary)" : ""}`);
+      console.log(`✅ Sent recap prompt to ${user}${hasSummary ? " (with pre-generated summary in Supabase)" : ""}`);
     } catch (e) {
       console.error(`❌ DM failed for ${user}:`, e.data || e.message);
     }
@@ -499,23 +587,21 @@ app.action("open_recap_modal", async ({ ack, body, client }) => {
   await ack();
 
   const userId = body.user.id;
+  const teamId = body.team?.id || null;
   
-  // Check if we have a pre-generated summary in cache
-  let prefill = summaryCache.get(userId) || null;
+  // Load summary from Supabase
+  let prefill = await loadSummaryFromSupabase(userId, teamId);
   
-  // If we have a cached summary, open the modal immediately with the content
+  // If we have a summary in Supabase, use it
   if (prefill) {
-    console.log(`⚡ Using cached summary for ${userId}`);
-    console.log(`📋 Cached summary:`, JSON.stringify(prefill));
+    console.log(`⚡ Loaded summary from Supabase for ${userId}`);
+    console.log(`📋 Summary:`, JSON.stringify(prefill));
     
     // Normalize the summary to ensure all fields are strings
     prefill = normalizeSummary(prefill);
     console.log(`✅ Normalized summary:`, JSON.stringify(prefill));
     
-    // Remove from cache after use (one-time use)
-    summaryCache.delete(userId);
-    
-    // Open modal directly with prefilled content - no loading state needed!
+    // Open modal with prefilled content
     await client.views.open({
       trigger_id: body.trigger_id,
       view: {
@@ -570,64 +656,30 @@ app.action("open_recap_modal", async ({ ack, body, client }) => {
               type: "plain_text_input",
               action_id: "value",
               multiline: true,
+              ...getInitialValue(prefill.notes),
             },
           },
         ],
         private_metadata: JSON.stringify({
           user_id: body.user.id,
+          team_id: teamId,
           submitted_at: new Date().toISOString(),
+          recap_id: prefill.recap_id || null, // Store the recap ID so we can update it
         }),
       },
     });
     return;
   }
   
-  // No cached summary - fall back to loading state and generate on-the-fly
-  console.log(`⏳ No cached summary for ${userId}, generating on-the-fly...`);
+  // No summary in Supabase - open modal with empty fields
+  console.log(`⏳ No summary found in Supabase for ${userId}, opening empty modal`);
   
-  // Initialize prefill (reuse the variable)
-  prefill = { progress: "", blockers: "", plan: "" };
+  // Initialize prefill as empty
+  prefill = { progress: "", blockers: "", plan: "", notes: "" };
   
-  // Open modal with loading state
-  const modalResult = await client.views.open({
+  // Open modal with empty fields
+  await client.views.open({
     trigger_id: body.trigger_id,
-    view: {
-      type: "modal",
-      callback_id: "recap_submit",
-      title: { type: "plain_text", text: "Daily Recap" },
-      submit: { type: "plain_text", text: "Save" },
-      close: { type: "plain_text", text: "Cancel" },
-      blocks: [
-        {
-          type: "section",
-          text: { type: "mrkdwn", text: "⏳ *Loading AI summary from your commits...*" },
-        },
-      ],
-      private_metadata: JSON.stringify({
-        user_id: body.user.id,
-        submitted_at: new Date().toISOString(),
-      }),
-    },
-  });
-
-  // Fetch commits and AI summary
-  const email = await getSlackUserEmail(userId);
-  const commits = email ? await getCommitsFromSupabase(email) : null;
-  
-  if (commits && commits.length > 0) {
-    console.log(`🤖 Summarizing ${commits.length} commits for ${email}`);
-    const summary = await summarizeActivity(commits, []);
-    if (summary) {
-      // Normalize summary before using
-      prefill = normalizeSummary(summary);
-    }
-  } else {
-    console.log(`📭 No commits found for ${email || userId}`);
-  }
-
-  // Update the modal with the AI-generated content
-  await client.views.update({
-    view_id: modalResult.view.id,
     view: {
       type: "modal",
       callback_id: "recap_submit",
@@ -685,7 +737,9 @@ app.action("open_recap_modal", async ({ ack, body, client }) => {
       ],
       private_metadata: JSON.stringify({
         user_id: body.user.id,
+        team_id: teamId,
         submitted_at: new Date().toISOString(),
+        recap_id: null,
       }),
     },
   });
@@ -700,42 +754,65 @@ app.action("skip_today", async ({ ack, body, client }) => {
   });
 });
 
-// Modal submission -> just log
+// Modal submission -> save or update in Supabase
 app.view("recap_submit", async ({ ack, body, view, client }) => {
     await ack();
   
     const meta = JSON.parse(view.private_metadata || "{}");
-  
-    const recap = {
+    const recapId = meta.recap_id;
+    
+    const recapData = {
       user_id: meta.user_id,
-      team_id: body.team?.id ?? null,
+      team_id: meta.team_id || (body.team?.id ?? null),
       submitted_at: meta.submitted_at, // ISO string is fine; Supabase casts to timestamptz
-      progress: view.state.values.Progress.value.value,
-      blockers: view.state.values.Blockers.value.value,
-      plan: view.state.values.Plan.value.value,
-      notes: view.state.values.Notes?.value?.value || null
+      progress: view.state.values.Progress?.value?.value || "",
+      blockers: view.state.values.Blockers?.value?.value || "",
+      plan: view.state.values.Plan?.value?.value || "",
+      notes: view.state.values.Notes?.value?.value || null,
+      is_ai_generated: false, // Mark as user-edited
     };
   
-    const { data, error } = await supabase
-      .from("daily_recaps")
-      .insert(recap)
-      .select()
-      .single();
+    let data, error;
+    
+    if (recapId) {
+      // Update existing record
+      console.log(`🔄 Updating existing recap ${recapId} in Supabase`);
+      const result = await supabase
+        .from("daily_recaps")
+        .update(recapData)
+        .eq("id", recapId)
+        .select()
+        .single();
+      
+      data = result.data;
+      error = result.error;
+    } else {
+      // Insert new record
+      console.log(`➕ Inserting new recap to Supabase`);
+      const result = await supabase
+        .from("daily_recaps")
+        .insert(recapData)
+        .select()
+        .single();
+      
+      data = result.data;
+      error = result.error;
+    }
   
     if (error) {
-      console.error("❌ Supabase insert failed:", error);
+      console.error("❌ Supabase save failed:", error);
       await client.chat.postMessage({
         channel: meta.user_id,
-        text: "Saved failed ❌ (Supabase error). Check server logs."
+        text: "Save failed ❌ (Supabase error). Check server logs."
       });
       return;
     }
   
-    console.log("✅ Saved to Supabase:", data.id);
+    console.log(`✅ ${recapId ? 'Updated' : 'Saved'} recap in Supabase:`, data.id);
   
     await client.chat.postMessage({
       channel: meta.user_id,
-      text: "Saved ✅ (uploaded to Supabase)."
+      text: `Saved ✅ ${recapId ? '(updated in Supabase)' : '(uploaded to Supabase)'}.`
     });
   });
   
