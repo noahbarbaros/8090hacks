@@ -8,6 +8,7 @@ A simple Next.js application that connects to a GitHub repository and tracks Com
     ```bash
     npm install
     ```
+    pip install --upgrade google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
 2.  **Run the development server**:
     ```bash
