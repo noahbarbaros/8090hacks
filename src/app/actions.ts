@@ -16,10 +16,18 @@ export async function fetchGitHubData(token: string, owner: string, repo: string
       github.getUser(),
     ]);
 
+    // Filter commits to only show those from the authenticated user
+    const userLogin = user.login;
+    const filteredCommits = commits.filter((commit: any) => {
+      const authorLogin = commit.author?.login;
+      const committerLogin = commit.committer?.login;
+      return authorLogin === userLogin || committerLogin === userLogin;
+    });
+
     return {
       success: true,
       data: {
-        commits,
+        commits: filteredCommits,
         prs,
         issues,
         user
@@ -36,6 +44,21 @@ export async function fetchGitHubData(token: string, owner: string, repo: string
 export async function getGoogleAuthUrl() {
   const calendarService = new GoogleCalendarService();
   return calendarService.generateAuthUrl();
+}
+
+export async function disconnectGoogleCalendar() {
+  try {
+    const cookieStore = await cookies();
+    // Delete the cookie by setting it with an expired date
+    cookieStore.set("google_tokens", "", {
+      expires: new Date(0),
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+    });
+    return { success: true };
+  } catch (error: any) {
+    return { success: false, error: error.message || "Failed to disconnect" };
+  }
 }
 
 export async function fetchCalendarEvents() {
@@ -56,7 +79,25 @@ export async function fetchCalendarEvents() {
   }
 }
 
-export async function fetchSlackMessages(channelId: string) {
+export async function getGoogleUserEmail() {
+  const cookieStore = await cookies();
+  const tokenCookie = cookieStore.get("google_tokens");
+  
+  if (!tokenCookie) {
+    return { success: false, error: "Not authenticated with Google" };
+  }
+
+  try {
+    const tokens = JSON.parse(tokenCookie.value);
+    const calendarService = new GoogleCalendarService();
+    const email = await calendarService.getUserEmail(tokens);
+    return { success: true, email };
+  } catch (error: any) {
+     return { success: false, error: error.message || "Failed to get user email" };
+  }
+}
+
+export async function fetchSlackMessages(channelId: string, userEmail?: string) {
     const token = process.env.SLACK_BOT_TOKEN;
     
     if (!token) {
@@ -66,13 +107,26 @@ export async function fetchSlackMessages(channelId: string) {
     try {
         const slack = new SlackService(token);
         const messages = await slack.getChannelHistory(channelId);
-        return { success: true, data: messages };
+        
+        // Filter messages by user if email is provided
+        let filteredMessages = messages;
+        if (userEmail) {
+            const slackUserId = await slack.getSlackUserIdFromEmail(userEmail);
+            if (slackUserId) {
+                filteredMessages = messages.filter((msg: any) => msg.user === slackUserId);
+            } else {
+                // If we can't find the user, return empty array
+                filteredMessages = [];
+            }
+        }
+        
+        return { success: true, data: filteredMessages };
     } catch (error: any) {
         return { success: false, error: error.message || "Failed to fetch Slack messages" };
     }
 }
 
-export async function sendSlackPrompts(commits?: any[], slackMessages?: any[], calendarEvents?: any[], userEmail?: string) {
+export async function sendSlackPrompts(commits?: any[], slackMessages?: any[], calendarEvents?: any[], googleEmail?: string) {
     const backendUrl = process.env.BACKEND_URL || "http://localhost:3000";
     
     try {
@@ -85,7 +139,7 @@ export async function sendSlackPrompts(commits?: any[], slackMessages?: any[], c
                 commits: commits || [],
                 slackMessages: slackMessages || [],
                 calendarEvents: calendarEvents || [],
-                userEmail: userEmail || null,
+                googleEmail: googleEmail || null, // Email from Google Calendar connection
             }),
         });
         

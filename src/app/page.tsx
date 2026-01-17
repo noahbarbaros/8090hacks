@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { fetchGitHubData, getGoogleAuthUrl, fetchCalendarEvents, fetchSlackMessages, sendSlackPrompts } from "./actions";
+import { fetchGitHubData, getGoogleAuthUrl, fetchCalendarEvents, fetchSlackMessages, sendSlackPrompts, getGoogleUserEmail, disconnectGoogleCalendar } from "./actions";
 import { GitCommit, GitPullRequest, CircleDot, Github, Loader2, Calendar, MessageSquare, Send } from "lucide-react";
 
 export default function Home() {
@@ -37,18 +37,22 @@ export default function Home() {
     loadCalendar();
   }, []);
 
-  // Load Slack messages on mount
+  // Load Slack messages on mount and when Google email is available
   useEffect(() => {
       const loadSlack = async () => {
           setSlackLoading(true);
-          const result = await fetchSlackMessages(SLACK_CHANNEL_ID);
+          // Get Google email to filter messages by user
+          const googleEmailResult = await getGoogleUserEmail();
+          const userEmail = googleEmailResult.success ? googleEmailResult.email : undefined;
+          
+          const result = await fetchSlackMessages(SLACK_CHANNEL_ID, userEmail);
           if (result.success && result.data) {
               setSlackMessages(result.data);
           }
           setSlackLoading(false);
       };
       loadSlack();
-  }, []);
+  }, [isGoogleConnected]);
 
 
   const handleConnectGitHub = async (e: React.FormEvent) => {
@@ -76,11 +80,34 @@ export default function Home() {
       window.location.href = url;
   };
 
+  const handleReconnectGoogle = async () => {
+      // Disconnect first, then reconnect
+      await disconnectGoogleCalendar();
+      setIsGoogleConnected(false);
+      setCalendarEvents([]);
+      // Small delay to ensure cookie is cleared, then redirect to reconnect
+      setTimeout(() => {
+          handleConnectGoogle();
+      }, 100);
+  };
+
   const handleSendSlackPrompts = async () => {
     setSendingPrompts(true);
     setPromptStatus(null);
     
     try {
+      // Get Google Calendar email (required for sending to specific user)
+      const googleEmailResult = await getGoogleUserEmail();
+      if (!googleEmailResult.success || !googleEmailResult.email) {
+        const errorMsg = googleEmailResult.error?.includes('reconnect') 
+          ? "Please reconnect Google Calendar to grant email access"
+          : "Please connect Google Calendar first";
+        setPromptStatus({ type: "error", message: errorMsg });
+        setSendingPrompts(false);
+        setTimeout(() => setPromptStatus(null), 5000);
+        return;
+      }
+      
       // Filter calendar events to only today and yesterday
       const today = new Date();
       today.setHours(0, 0, 0, 0);
@@ -99,10 +126,9 @@ export default function Home() {
       });
       
       // Pass commits from the dashboard + Slack messages + filtered calendar events for the AI summary
-      // Also pass user email to filter Slack messages to only those from the user
+      // Pass Google email to send prompt only to that user's Slack account
       const commits = data?.commits || [];
-      const userEmail = data?.user?.email || null;
-      const result = await sendSlackPrompts(commits, slackMessages, filteredCalendarEvents, userEmail);
+      const result = await sendSlackPrompts(commits, slackMessages, filteredCalendarEvents, googleEmailResult.email);
       if (result.success) {
         setPromptStatus({ type: "success", message: result.message || "Prompts sent!" });
       } else {
@@ -152,12 +178,16 @@ export default function Home() {
                     )}
                  </div>
                  
-                 {/* Google Calendar Connect Button */}
+                 {/* Google Calendar Connect/Reconnect Button */}
                  {isGoogleConnected ? (
-                     <div className="flex items-center text-green-600 bg-green-50 px-3 py-1 rounded-full text-sm font-medium">
-                         <Calendar className="w-4 h-4 mr-2" />
-                         Calendar Connected
-                     </div>
+                     <button 
+                        onClick={handleReconnectGoogle}
+                        className="flex items-center space-x-2 bg-green-50 border border-green-200 text-green-700 px-4 py-2 rounded-lg hover:bg-green-100 transition-colors"
+                        title="Reconnect to grant email access"
+                    >
+                        <Calendar className="w-5 h-5" />
+                        <span>Reconnect Calendar</span>
+                    </button>
                  ) : (
                     <button 
                         onClick={handleConnectGoogle}
@@ -238,8 +268,11 @@ export default function Home() {
               </div>
               <div className="space-y-4">
                 {slackLoading && <Loader2 className="w-6 h-6 animate-spin mx-auto text-gray-400" />}
-                {!slackLoading && slackMessages.length === 0 && (
-                    <p className="text-gray-500 text-sm">No recent messages in #all-8090-hackathon.</p>
+                {!slackLoading && !isGoogleConnected && (
+                    <p className="text-gray-500 text-sm">Connect Google Calendar to see your Slack messages.</p>
+                )}
+                {!slackLoading && isGoogleConnected && slackMessages.length === 0 && (
+                    <p className="text-gray-500 text-sm">No recent messages from you in #all-8090-hackathon.</p>
                 )}
                 {slackMessages.map((msg: any) => (
                   <div key={msg.ts} className="border-b border-gray-100 pb-3 last:border-0">

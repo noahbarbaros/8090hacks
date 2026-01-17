@@ -3,6 +3,8 @@ const { App, ExpressReceiver } = pkg;
 import "dotenv/config";
 import OpenAI from "openai";
 import express from "express";
+import { google } from "googleapis";
+import { Octokit } from "octokit";
 
 import { createClient } from "@supabase/supabase-js";
 
@@ -46,6 +48,276 @@ const app = new App({
 function getTodayDateString() {
   const today = new Date();
   return today.toISOString().split('T')[0];
+}
+
+// ==================== USER CONNECTIONS HELPERS ====================
+
+// Get user connection from Supabase
+async function getUserConnection(slackUserId, teamId) {
+  try {
+    const { data, error } = await supabase
+      .from("user_connections")
+      .select("*")
+      .eq("slack_user_id", slackUserId)
+      .eq("team_id", teamId)
+      .single();
+    
+    if (error && error.code !== 'PGRST116') {
+      console.error("❌ Error fetching user connection:", error);
+      return null;
+    }
+    
+    return data || null;
+  } catch (error) {
+    console.error("❌ Error in getUserConnection:", error);
+    return null;
+  }
+}
+
+// Save or update user connection in Supabase
+async function saveUserConnection(slackUserId, teamId, updates) {
+  try {
+    // Check if connection exists
+    const existing = await getUserConnection(slackUserId, teamId);
+    
+    if (existing) {
+      // Update existing
+      const { data, error } = await supabase
+        .from("user_connections")
+        .update({
+          ...updates,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("slack_user_id", slackUserId)
+        .eq("team_id", teamId)
+        .select()
+        .single();
+      
+      if (error) {
+        console.error("❌ Error updating user connection:", error);
+        return null;
+      }
+      
+      return data;
+    } else {
+      // Insert new
+      const { data, error } = await supabase
+        .from("user_connections")
+        .insert({
+          slack_user_id: slackUserId,
+          team_id: teamId,
+          ...updates,
+        })
+        .select()
+        .single();
+      
+      if (error) {
+        console.error("❌ Error creating user connection:", error);
+        return null;
+      }
+      
+      return data;
+    }
+  } catch (error) {
+    console.error("❌ Error in saveUserConnection:", error);
+    return null;
+  }
+}
+
+// ==================== GOOGLE CALENDAR HELPERS ====================
+
+const GOOGLE_SCOPES = [
+  'https://www.googleapis.com/auth/calendar.readonly',
+  'https://www.googleapis.com/auth/userinfo.email',
+  'openid'
+];
+
+function createGoogleOAuth2Client() {
+  const client_id = process.env.GOOGLE_CLIENT_ID;
+  const client_secret = process.env.GOOGLE_CLIENT_SECRET;
+  // Use frontend callback route (Next.js runs on port 3001)
+  const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3001";
+  const redirectUri = `${frontendUrl}/api/google/callback`;
+  
+  if (!client_id || !client_secret) {
+    throw new Error("Google credentials not found in environment variables");
+  }
+
+  return new google.auth.OAuth2(
+    client_id,
+    client_secret,
+    redirectUri
+  );
+}
+
+async function fetchUserCalendarEvents(slackUserId, teamId) {
+  const connection = await getUserConnection(slackUserId, teamId);
+  
+  if (!connection || !connection.google_tokens) {
+    return [];
+  }
+  
+  try {
+    const oauth2Client = createGoogleOAuth2Client();
+    oauth2Client.setCredentials(connection.google_tokens);
+    
+    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+    
+    const res = await calendar.events.list({
+      calendarId: 'primary',
+      timeMin: new Date().toISOString(),
+      maxResults: 10,
+      singleEvents: true,
+      orderBy: 'startTime',
+    });
+    
+    return res.data.items || [];
+  } catch (error) {
+    console.error("❌ Error fetching calendar events:", error);
+    return [];
+  }
+}
+
+async function getUserEmailFromGoogleTokens(tokens) {
+  // First, try to get email from id_token if available
+  if (tokens.id_token) {
+    try {
+      const base64Url = tokens.id_token.split('.')[1];
+      const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+      const jsonPayload = decodeURIComponent(Buffer.from(base64, 'base64').toString().split('').map(function(c) {
+        return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+      }).join(''));
+      const decoded = JSON.parse(jsonPayload);
+      if (decoded.email) {
+        return decoded.email;
+      }
+    } catch (e) {
+      console.log('Could not decode id_token, trying API call...');
+    }
+  }
+  
+  // Fallback: try API call
+  const oauth2Client = createGoogleOAuth2Client();
+  oauth2Client.setCredentials(tokens);
+  const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
+  
+  try {
+    const res = await oauth2.userinfo.get();
+    return res.data.email || null;
+  } catch (error) {
+    console.error('Error getting user email:', error);
+    return null;
+  }
+}
+
+// ==================== GITHUB HELPERS ====================
+
+async function fetchUserGitHubCommits(slackUserId, teamId) {
+  const connection = await getUserConnection(slackUserId, teamId);
+  
+  if (!connection || !connection.github_token) {
+    return [];
+  }
+  
+  try {
+    const octokit = new Octokit({ auth: connection.github_token });
+    
+    // Get the authenticated user
+    const userResponse = await octokit.request("GET /user");
+    const userLogin = userResponse.data.login;
+    
+    // Get all repositories the user has access to
+    const reposResponse = await octokit.request("GET /user/repos", {
+      per_page: 100,
+      sort: "updated",
+      direction: "desc",
+    });
+    
+    const repos = reposResponse.data;
+    const allCommits = [];
+    
+    // Fetch commits from each repository
+    // Limit to most recently updated repos to avoid too many API calls
+    const reposToCheck = repos.slice(0, 20); // Check top 20 most recently updated repos
+    
+    for (const repo of reposToCheck) {
+      try {
+        const commitsResponse = await octokit.request("GET /repos/{owner}/{repo}/commits", {
+          owner: repo.owner.login,
+          repo: repo.name,
+          per_page: 10,
+          author: userLogin, // Filter by author to get only user's commits
+        });
+        
+        // Filter commits to ensure only those authored by the user
+        // Check both author.login and committer.login to be thorough
+        const userCommits = commitsResponse.data.filter((commit) => {
+          const authorLogin = commit.author?.login;
+          const committerLogin = commit.committer?.login;
+          return authorLogin === userLogin || committerLogin === userLogin;
+        });
+        
+        // Add repo info to each commit
+        const commitsWithRepo = userCommits.map(commit => ({
+          ...commit,
+          repo: repo.name,
+          owner: repo.owner.login,
+        }));
+        
+        allCommits.push(...commitsWithRepo);
+      } catch (error) {
+        // Skip repos that fail (might be private repos without access, etc.)
+        console.log(`⚠️ Could not fetch commits from ${repo.owner.login}/${repo.name}:`, error.message);
+        continue;
+      }
+    }
+    
+    // Sort by date (most recent first) and limit to 50 commits
+    const sortedCommits = allCommits
+      .sort((a, b) => {
+        const dateA = new Date(a.commit.author.date);
+        const dateB = new Date(b.commit.author.date);
+        return dateB - dateA;
+      })
+      .slice(0, 50);
+    
+    return sortedCommits;
+  } catch (error) {
+    console.error("❌ Error fetching GitHub commits:", error);
+    return [];
+  }
+}
+
+async function fetchUserSlackMessages(slackUserId, channelId) {
+  try {
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    const oldestTimestamp = (yesterday.getTime() / 1000).toString();
+
+    const result = await app.client.conversations.history({
+      channel: channelId,
+      oldest: oldestTimestamp,
+      limit: 100,
+    });
+
+    if (!result.messages) {
+      return [];
+    }
+
+    // Filter messages to only include those from the user
+    const filteredMessages = result.messages
+      .filter((msg) => !msg.subtype && msg.user === slackUserId)
+      .map((msg) => ({
+        text: msg.text || "",
+        user: msg.user || "Unknown User",
+        ts: msg.ts,
+      }));
+
+    return filteredMessages;
+  } catch (error) {
+    console.error(`❌ Error fetching Slack messages for user ${slackUserId}:`, error);
+    return [];
+  }
 }
 
 // Helper function to save AI-generated summary to Supabase
@@ -246,6 +518,87 @@ IMPORTANT: Each field MUST be a string. Use 3-5 bullet points per field. Be conc
 }
 
 
+// ==================== OAUTH CALLBACK ROUTES ====================
+
+// Google OAuth callback - receives code, exchanges via frontend, saves to Supabase
+receiver.router.get("/api/google/callback", async (req, res) => {
+  try {
+    const { code, state } = req.query;
+    
+    if (!code) {
+      return res.status(400).send("No authorization code provided");
+    }
+    
+    if (!state) {
+      return res.status(400).send("No state parameter provided");
+    }
+    
+    // Parse state: format is "slack_user_id|team_id"
+    const [slackUserId, teamId] = state.split('|');
+    
+    if (!slackUserId || !teamId) {
+      return res.status(400).send("Invalid state parameter");
+    }
+    
+    // Exchange code for tokens via frontend API
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3001";
+    const exchangeResponse = await fetch(`${frontendUrl}/api/google/exchange-token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
+    
+    if (!exchangeResponse.ok) {
+      const errorData = await exchangeResponse.json().catch(() => ({}));
+      throw new Error(errorData.error || "Failed to exchange code for tokens");
+    }
+    
+    const { tokens, email } = await exchangeResponse.json();
+    
+    if (!tokens) {
+      throw new Error("No tokens returned from frontend");
+    }
+    
+    // Get Slack user info (name)
+    const userInfo = await getSlackUserInfo(slackUserId);
+    
+    // Save tokens to Supabase with user name
+    const connection = await saveUserConnection(slackUserId, teamId, {
+      slack_user_name: userInfo.name,
+      google_tokens: tokens,
+    });
+    
+    if (!connection) {
+      return res.status(500).send("Failed to save connection. Please try again.");
+    }
+    
+    // Notify user in Slack
+    try {
+      await app.client.chat.postMessage({
+        channel: slackUserId,
+        text: email 
+          ? `✅ Google Calendar connected successfully! (${email})\n\nYou can close this browser window and return to Slack.`
+          : "✅ Google Calendar connected successfully!\n\nYou can close this browser window and return to Slack.",
+      });
+    } catch (slackError) {
+      console.error("Failed to send Slack notification:", slackError);
+    }
+    
+    res.send(`
+      <html>
+        <body>
+          <h1>✅ Google Calendar Connected!</h1>
+          <p>You can close this window and return to Slack.</p>
+          <script>setTimeout(() => window.close(), 2000);</script>
+        </body>
+      </html>
+    `);
+  } catch (error) {
+    console.error("❌ Error in Google OAuth callback:", error);
+    res.status(500).send("Authentication failed. Please try again.");
+  }
+});
+
 // API endpoint for frontend to trigger sending prompts to a specific user
 // Accepts optional commits, slackMessages, calendarEvents, and googleEmail from frontend
 // Sends prompt only to the Slack account associated with the Google Calendar email
@@ -375,6 +728,26 @@ async function getSlackUserEmail(userId) {
   } catch (e) {
     console.error("Failed to get user email:", e.message);
     return null;
+  }
+}
+
+// Get Slack user's name and email
+async function getSlackUserInfo(userId) {
+  try {
+    const result = await app.client.users.info({
+      user: userId,
+    });
+    const user = result.user;
+    return {
+      name: user?.real_name || user?.display_name || user?.name || "Unknown",
+      email: user?.profile?.email?.toLowerCase() || null,
+    };
+  } catch (e) {
+    console.error("Failed to get user info:", e.message);
+    return {
+      name: "Unknown",
+      email: null,
+    };
   }
 }
 
@@ -754,17 +1127,319 @@ app.action("skip_today", async ({ ack, body, client }) => {
   });
 });
 
+// ==================== SLASH COMMANDS ====================
+
+// /connect-google - Initiate Google Calendar OAuth (uses frontend for auth URL)
+app.command("/connect-google", async ({ ack, body, client }) => {
+  try {
+    await ack();
+  } catch (ackError) {
+    console.error("❌ Failed to acknowledge command:", ackError);
+    return;
+  }
+  
+  const userId = body.user_id;
+  const teamId = body.team_id;
+  
+  try {
+    // Get auth URL from frontend (which has the Google credentials)
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3001";
+    const backendUrl = process.env.BACKEND_URL || "http://localhost:3000";
+    const state = `${userId}|${teamId}`;
+    
+    const response = await fetch(`${frontendUrl}/api/google/auth-url?state=${encodeURIComponent(state)}&backend_url=${encodeURIComponent(backendUrl)}`);
+    
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error || "Failed to get Google auth URL from frontend");
+    }
+    
+    const { authUrl } = await response.json();
+    
+    if (!authUrl) {
+      throw new Error("No auth URL returned from frontend");
+    }
+    
+    await client.chat.postMessage({
+      channel: userId,
+      text: `Connect Google Calendar\n\nClick here to authorize: ${authUrl}`,
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: "🔗 *Connect Google Calendar*\n\nClick the button below to open Google's authorization page in your browser. You'll be asked to sign in and grant access to your Google Calendar.",
+          },
+        },
+        {
+          type: "actions",
+          elements: [
+            {
+              type: "button",
+              text: { type: "plain_text", text: "🔐 Authorize Google Calendar", emoji: true },
+              url: authUrl,
+              style: "primary",
+            },
+          ],
+        },
+        {
+          type: "context",
+          elements: [
+            {
+              type: "mrkdwn",
+              text: `Or copy this link: <${authUrl}|Open in browser>`,
+            },
+          ],
+        },
+      ],
+    });
+  } catch (error) {
+    console.error("❌ Error in /connect-google:", error);
+    await client.chat.postMessage({
+      channel: userId,
+      text: error.message && error.message.includes("frontend")
+        ? "❌ Failed to connect to frontend. Make sure the frontend is running and accessible."
+        : "❌ Failed to generate Google Calendar connection link. Please try again later.",
+    });
+  }
+});
+
+// /connect-github - Open modal to enter GitHub token only
+app.command("/connect-github", async ({ ack, body, client }) => {
+  try {
+    await ack();
+  } catch (ackError) {
+    console.error("❌ Failed to acknowledge command:", ackError);
+    return;
+  }
+  
+  const userId = body.user_id;
+  const teamId = body.team_id;
+  
+  try {
+    // Check if already connected
+    const connection = await getUserConnection(userId, teamId);
+    const hasGitHub = connection && connection.github_token;
+    
+    await client.views.open({
+      trigger_id: body.trigger_id,
+      view: {
+        type: "modal",
+        callback_id: "github_connect",
+        title: { type: "plain_text", text: "Connect GitHub" },
+        submit: { type: "plain_text", text: "Connect" },
+        close: { type: "plain_text", text: "Cancel" },
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: hasGitHub 
+                ? "🔗 *Update GitHub Connection*\n\nEnter your GitHub Personal Access Token. We'll fetch commits from all repositories you have access to."
+                : "🔗 *Connect GitHub*\n\nEnter your GitHub Personal Access Token. We'll fetch commits from all repositories you have access to.",
+            },
+          },
+          {
+            type: "input",
+            block_id: "github_token",
+            label: { type: "plain_text", text: "GitHub Personal Access Token" },
+            element: {
+              type: "plain_text_input",
+              action_id: "value",
+              placeholder: { type: "plain_text", text: "ghp_..." },
+              ...(hasGitHub && connection.github_token ? { initial_value: connection.github_token } : {}),
+            },
+            hint: { type: "plain_text", text: "Create a token at github.com/settings/tokens with 'repo' scope" },
+          },
+        ],
+        private_metadata: JSON.stringify({
+          user_id: userId,
+          team_id: teamId,
+        }),
+      },
+    });
+  } catch (error) {
+    console.error("❌ Error in /connect-github:", error);
+    try {
+      await client.chat.postMessage({
+        channel: userId,
+        text: "❌ Failed to open GitHub connection modal. Please try again later.",
+      });
+    } catch (postError) {
+      console.error("❌ Failed to send error message:", postError);
+    }
+  }
+});
+
+// Handle GitHub connection modal submission
+app.view("github_connect", async ({ ack, body, view, client }) => {
+  await ack();
+  
+  const meta = JSON.parse(view.private_metadata || "{}");
+  const userId = meta.user_id;
+  const teamId = meta.team_id;
+  
+  const token = view.state.values.github_token?.value?.value || "";
+  
+  if (!token) {
+    await client.chat.postMessage({
+      channel: userId,
+      text: "❌ Token is required. Please try again.",
+    });
+    return;
+  }
+  
+  // Validate token by making a test API call
+  try {
+    const octokit = new Octokit({ auth: token });
+    const userResponse = await octokit.request("GET /user");
+    const username = userResponse.data.login;
+    
+    // Get Slack user info (name)
+    const userInfo = await getSlackUserInfo(userId);
+    
+    // Save connection (only token, no owner/repo) with user name
+    const connection = await saveUserConnection(userId, teamId, {
+      slack_user_name: userInfo.name,
+      github_token: token,
+      github_owner: null,
+      github_repo: null,
+    });
+    
+    if (connection) {
+      await client.chat.postMessage({
+        channel: userId,
+        text: `✅ GitHub connected successfully! (${username})\n\nWe'll fetch commits from all repositories you have access to.`,
+      });
+    } else {
+      await client.chat.postMessage({
+        channel: userId,
+        text: "❌ Failed to save GitHub connection. Please try again.",
+      });
+    }
+  } catch (error) {
+    console.error("❌ Error validating GitHub token:", error);
+    await client.chat.postMessage({
+      channel: userId,
+      text: "❌ Invalid GitHub token. Please check your token and try again.",
+    });
+  }
+});
+
+// /recap - Generate daily recap from all connected services
+app.command("/recap", async ({ ack, body, client }) => {
+  try {
+    await ack();
+  } catch (ackError) {
+    console.error("❌ Failed to acknowledge command:", ackError);
+    return;
+  }
+  
+  // Always use the actual Slack user who ran the command
+  const userId = body.user_id;
+  const teamId = body.team_id;
+  
+  console.log(`📝 /recap command executed by Slack user: ${userId} (team: ${teamId})`);
+  
+  try {
+    // Send initial message
+    const loadingMessage = await client.chat.postMessage({
+      channel: userId,
+      text: "🔄 Generating your daily recap...",
+    });
+    
+    // Fetch data from all connected services
+    const [commits, calendarEvents, slackMessages] = await Promise.all([
+      fetchUserGitHubCommits(userId, teamId),
+      fetchUserCalendarEvents(userId, teamId),
+      fetchUserSlackMessages(userId, process.env.SLACK_CHANNEL_ID || ""),
+    ]);
+    
+    console.log(`📊 Fetched data for user ${userId}: ${commits.length} commits, ${calendarEvents.length} calendar events, ${slackMessages.length} Slack messages`);
+    
+    // Filter calendar events to today and yesterday
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    
+    const filteredCalendarEvents = calendarEvents.filter((event) => {
+      if (!event.start?.dateTime && !event.start?.date) return false;
+      
+      const eventDate = event.start.dateTime 
+        ? new Date(event.start.dateTime)
+        : new Date(event.start.date);
+      eventDate.setHours(0, 0, 0, 0);
+      
+      return eventDate.getTime() === today.getTime() || eventDate.getTime() === yesterday.getTime();
+    });
+    
+    // Generate AI summary
+    const summary = await summarizeActivity(commits, slackMessages, filteredCalendarEvents);
+    
+    if (!summary) {
+      await client.chat.update({
+        channel: loadingMessage.channel,
+        ts: loadingMessage.ts,
+        text: "⚠️ No activity found to summarize. Make sure you've connected GitHub and Google Calendar, and have some recent activity.",
+      });
+      return;
+    }
+    
+    // Save summary to Supabase (using actual Slack user ID)
+    console.log(`💾 Saving summary to Supabase for user ${userId}`);
+    await saveSummaryToSupabase(userId, teamId, summary);
+    
+    // Update message with button to open modal
+    await client.chat.update({
+      channel: loadingMessage.channel,
+      ts: loadingMessage.ts,
+      text: "✅ Your daily recap is ready!",
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: "✅ *Your daily recap is ready!*\n\nClick the button below to review and edit your AI-generated summary.",
+          },
+        },
+        {
+          type: "actions",
+          elements: [
+            {
+              type: "button",
+              text: { type: "plain_text", text: "📝 Review & Edit Recap", emoji: true },
+              action_id: "open_recap_modal",
+              style: "primary",
+            },
+          ],
+        },
+      ],
+    });
+  } catch (error) {
+    console.error("❌ Error in /recap:", error);
+    await client.chat.postMessage({
+      channel: userId,
+      text: "❌ Failed to generate recap. Please try again later.",
+    });
+  }
+});
+
 // Modal submission -> save or update in Supabase
 app.view("recap_submit", async ({ ack, body, view, client }) => {
     await ack();
   
+    // Always use the actual Slack user who submitted the form
+    const userId = body.user.id;
+    const teamId = body.team?.id || null;
+    
     const meta = JSON.parse(view.private_metadata || "{}");
     const recapId = meta.recap_id;
     
     const recapData = {
-      user_id: meta.user_id,
-      team_id: meta.team_id || (body.team?.id ?? null),
-      submitted_at: meta.submitted_at, // ISO string is fine; Supabase casts to timestamptz
+      user_id: userId, // Use actual user from body, not metadata
+      team_id: teamId,
+      submitted_at: meta.submitted_at || new Date().toISOString(), // ISO string is fine; Supabase casts to timestamptz
       progress: view.state.values.Progress?.value?.value || "",
       blockers: view.state.values.Blockers?.value?.value || "",
       plan: view.state.values.Plan?.value?.value || "",
@@ -802,16 +1477,16 @@ app.view("recap_submit", async ({ ack, body, view, client }) => {
     if (error) {
       console.error("❌ Supabase save failed:", error);
       await client.chat.postMessage({
-        channel: meta.user_id,
+        channel: userId,
         text: "Save failed ❌ (Supabase error). Check server logs."
       });
       return;
     }
   
-    console.log(`✅ ${recapId ? 'Updated' : 'Saved'} recap in Supabase:`, data.id);
+    console.log(`✅ ${recapId ? 'Updated' : 'Saved'} recap in Supabase for user ${userId} (recap ID: ${data.id})`);
   
     await client.chat.postMessage({
-      channel: meta.user_id,
+      channel: userId,
       text: `Saved ✅ ${recapId ? '(updated in Supabase)' : '(uploaded to Supabase)'}.`
     });
   });
@@ -825,5 +1500,10 @@ app.view("recap_submit", async ({ ack, body, view, client }) => {
   console.log(`📡 API endpoints ready:`);
   console.log(`   POST /api/send-prompts - Send prompts to all channel members`);
   console.log(`   POST /api/send-recap - Send recap for a specific user`);
-  console.log(`💡 Use the frontend to send recaps to Slack`);
+  console.log(`   GET  /api/google/callback - Google OAuth callback`);
+  console.log(`💬 Slack commands available:`);
+  console.log(`   /connect-google - Connect Google Calendar`);
+  console.log(`   /connect-github - Connect GitHub repository`);
+  console.log(`   /recap - Generate and edit daily recap`);
+  console.log(`💡 Everything works through Slack - no dashboard needed!`);
 })();

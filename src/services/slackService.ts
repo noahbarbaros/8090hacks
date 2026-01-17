@@ -66,6 +66,26 @@ export class SlackService {
       throw error;
     }
   }
+
+  /**
+   * Get Slack user ID from email (reverse lookup)
+   * @param email The email address to look up
+   */
+  async getSlackUserIdFromEmail(email: string) {
+    if (!email) return null;
+    
+    try {
+      // List all users and find the one with matching email
+      const result = await this.client.users.list();
+      const user = result.members?.find(
+        (u) => u.profile?.email?.toLowerCase() === email.toLowerCase()
+      );
+      return user?.id || null;
+    } catch (error) {
+      console.error("Failed to get Slack user ID from email:", error);
+      throw error;
+    }
+  }
 }
 
 // --- Test Execution Block ---
