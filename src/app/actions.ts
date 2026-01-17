@@ -71,3 +71,32 @@ export async function fetchSlackMessages(channelId: string) {
         return { success: false, error: error.message || "Failed to fetch Slack messages" };
     }
 }
+
+export async function sendSlackPrompts(commits?: any[], slackMessages?: any[], calendarEvents?: any[], userEmail?: string) {
+    const backendUrl = process.env.BACKEND_URL || "http://localhost:3000";
+    
+    try {
+        const response = await fetch(`${backendUrl}/api/send-prompts`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                commits: commits || [],
+                slackMessages: slackMessages || [],
+                calendarEvents: calendarEvents || [],
+                userEmail: userEmail || null,
+            }),
+        });
+        
+        const data = await response.json();
+        
+        if (!response.ok) {
+            return { success: false, error: data.error || "Failed to send Slack prompts" };
+        }
+        
+        return { success: true, message: data.message };
+    } catch (error: any) {
+        return { success: false, error: error.message || "Failed to connect to backend" };
+    }
+}

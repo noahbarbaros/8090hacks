@@ -1,8 +1,8 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { fetchGitHubData, getGoogleAuthUrl, fetchCalendarEvents, fetchSlackMessages } from "./actions";
-import { GitCommit, GitPullRequest, CircleDot, Github, Loader2, Calendar, MessageSquare } from "lucide-react";
+import { fetchGitHubData, getGoogleAuthUrl, fetchCalendarEvents, fetchSlackMessages, sendSlackPrompts } from "./actions";
+import { GitCommit, GitPullRequest, CircleDot, Github, Loader2, Calendar, MessageSquare, Send } from "lucide-react";
 
 export default function Home() {
   const [token, setToken] = useState("");
@@ -18,6 +18,8 @@ export default function Home() {
 
   const [slackMessages, setSlackMessages] = useState<any[]>([]);
   const [slackLoading, setSlackLoading] = useState(false);
+  const [sendingPrompts, setSendingPrompts] = useState(false);
+  const [promptStatus, setPromptStatus] = useState<{ type: "success" | "error"; message: string } | null>(null);
   // Hardcoded channel ID for #all-8090-hackathon found via script
   const SLACK_CHANNEL_ID = "C0A95GGELEP"; 
 
@@ -74,6 +76,47 @@ export default function Home() {
       window.location.href = url;
   };
 
+  const handleSendSlackPrompts = async () => {
+    setSendingPrompts(true);
+    setPromptStatus(null);
+    
+    try {
+      // Filter calendar events to only today and yesterday
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const yesterday = new Date(today);
+      yesterday.setDate(yesterday.getDate() - 1);
+      
+      const filteredCalendarEvents = calendarEvents.filter((event: any) => {
+        if (!event.start?.dateTime && !event.start?.date) return false;
+        
+        const eventDate = event.start.dateTime 
+          ? new Date(event.start.dateTime)
+          : new Date(event.start.date);
+        eventDate.setHours(0, 0, 0, 0);
+        
+        return eventDate.getTime() === today.getTime() || eventDate.getTime() === yesterday.getTime();
+      });
+      
+      // Pass commits from the dashboard + Slack messages + filtered calendar events for the AI summary
+      // Also pass user email to filter Slack messages to only those from the user
+      const commits = data?.commits || [];
+      const userEmail = data?.user?.email || null;
+      const result = await sendSlackPrompts(commits, slackMessages, filteredCalendarEvents, userEmail);
+      if (result.success) {
+        setPromptStatus({ type: "success", message: result.message || "Prompts sent!" });
+      } else {
+        setPromptStatus({ type: "error", message: result.error || "Failed to send prompts" });
+      }
+    } catch {
+      setPromptStatus({ type: "error", message: "An unexpected error occurred" });
+    } finally {
+      setSendingPrompts(false);
+      // Clear status after 3 seconds
+      setTimeout(() => setPromptStatus(null), 3000);
+    }
+  };
+
   return (
     <main className="min-h-screen bg-gray-50 p-8 text-black">
       <div className="max-w-[1600px] mx-auto space-y-8">
@@ -84,8 +127,32 @@ export default function Home() {
             <h1 className="text-3xl font-bold">Dev Dashboard</h1>
             </div>
             
-            {/* Google Calendar Connect Button */}
-            <div className="flex items-center space-x-2">
+            {/* Header Buttons */}
+            <div className="flex items-center space-x-3">
+                 {/* Send Slack Prompts Button */}
+                 <div className="relative">
+                    <button 
+                        onClick={handleSendSlackPrompts}
+                        disabled={sendingPrompts}
+                        className="flex items-center space-x-2 bg-pink-500 text-white px-4 py-2 rounded-lg hover:bg-pink-600 transition-colors disabled:opacity-50"
+                    >
+                        {sendingPrompts ? (
+                            <Loader2 className="w-5 h-5 animate-spin" />
+                        ) : (
+                            <Send className="w-5 h-5" />
+                        )}
+                        <span>Send Slack Prompts</span>
+                    </button>
+                    {promptStatus && (
+                        <div className={`absolute top-full mt-2 right-0 px-3 py-1 rounded-lg text-sm whitespace-nowrap ${
+                            promptStatus.type === "success" ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
+                        }`}>
+                            {promptStatus.message}
+                        </div>
+                    )}
+                 </div>
+                 
+                 {/* Google Calendar Connect Button */}
                  {isGoogleConnected ? (
                      <div className="flex items-center text-green-600 bg-green-50 px-3 py-1 rounded-full text-sm font-medium">
                          <Calendar className="w-4 h-4 mr-2" />

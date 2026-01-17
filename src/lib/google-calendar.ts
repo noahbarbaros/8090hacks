@@ -8,7 +8,7 @@ export class GoogleCalendarService {
   constructor() {
     const client_id = process.env.GOOGLE_CLIENT_ID;
     const client_secret = process.env.GOOGLE_CLIENT_SECRET;
-    const redirectUri = process.env.GOOGLE_REDIRECT_URI || "http://localhost:3000/api/google/callback";
+    const redirectUri = process.env.GOOGLE_REDIRECT_URI || "http://localhost:3001/api/google/callback";
     
     if (!client_id || !client_secret) {
       throw new Error("Google credentials not found in environment variables");
