@@ -735,6 +735,120 @@ receiver.router.post("/api/send-recap", async (req, res) => {
   }
 });
 
+// Helper to generate script for a single recap
+async function generateScriptForRecap(recap) {
+  try {
+    // Get user name
+    const userInfo = await getSlackUserInfo(recap.user_id);
+    const userName = userInfo.name || "Unknown User";
+    
+    // Construct prompt content from recap
+    const recapContent = `
+      Progress: ${recap.progress || "None"}
+      Blockers: ${recap.blockers || "None"}
+      Plan: ${recap.plan || "None"}
+      Notes: ${recap.notes || "None"}
+    `;
+    
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: `You are a scriptwriter. Convert this technical daily standup update into a natural, spoken script for a podcast. 
+The user is ${userName}. Start with "Hi, I'm ${userName}". 
+Avoid bullet points, use full sentences. Keep it under 1 minute spoken (approx 150 words).
+Make it sound conversational but professional.`,
+        },
+        {
+          role: "user",
+          content: recapContent,
+        },
+      ],
+    });
+    
+    const scriptText = response.choices[0].message.content;
+    
+    return {
+      recap_id: recap.id,
+      user_id: recap.user_id,
+      user_name: userName,
+      script: scriptText,
+    };
+  } catch (e) {
+    console.error(`❌ OpenAI generation failed for user ${recap.user_id}:`, e.message);
+    return null;
+  }
+}
+
+// API endpoint to generate TTS scripts from daily recaps
+receiver.router.post("/api/generate-scripts", async (req, res) => {
+  try {
+    const { recap_id, date, team_id } = req.body;
+    
+    console.log("🎬 Generating TTS scripts...");
+    
+    let query = supabase
+      .from("daily_recaps")
+      .select("*");
+      
+    if (recap_id) {
+      query = query.eq("id", recap_id);
+    } else {
+      // Default to today if no date provided
+      const targetDate = date || getTodayDateString();
+      query = query
+        .gte("submitted_at", `${targetDate}T00:00:00Z`)
+        .lt("submitted_at", `${targetDate}T23:59:59Z`);
+        
+      if (team_id) {
+        query = query.eq("team_id", team_id);
+      }
+    }
+    
+    const { data: recaps, error } = await query;
+    
+    if (error) {
+      console.error("❌ Supabase query failed:", error);
+      return res.status(500).json({ error: "Failed to fetch recaps" });
+    }
+    
+    if (!recaps || recaps.length === 0) {
+      return res.json({ scripts: [] });
+    }
+    
+    console.log(`📝 Found ${recaps.length} recaps to process`);
+    
+    const scripts = [];
+    
+    for (const recap of recaps) {
+      const script = await generateScriptForRecap(recap);
+      if (script) {
+        scripts.push(script);
+        
+        // Save to DB (upsert based on recap_id)
+        const { error: saveError } = await supabase
+          .from("daily_recap_scripts")
+          .upsert({
+            recap_id: script.recap_id,
+            user_id: script.user_id,
+            script_text: script.script,
+          }, { onConflict: "recap_id" });
+          
+        if (saveError) {
+          console.error(`⚠️ Failed to save script for recap ${script.recap_id}:`, saveError);
+        }
+      }
+    }
+    
+    res.json({ scripts });
+    
+  } catch (e) {
+    console.error("Error in /api/generate-scripts:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Get Slack user's email
 async function getSlackUserEmail(userId) {
   try {
@@ -1510,6 +1624,33 @@ app.view("recap_submit", async ({ ack, body, view, client }) => {
       channel: userId,
       text: `Saved ✅ ${recapId ? '(updated in Supabase)' : '(uploaded to Supabase)'}.`
     });
+
+    // Auto-generate script immediately in background
+    // Don't wait for ack() to complete
+    try {
+      console.log(`🎬 Auto-generating script for recap ${data.id}...`);
+      const scriptData = await generateScriptForRecap(data);
+      if (scriptData) {
+        console.log(`✅ Script generated successfully for ${data.id}`);
+        
+        // Save script to Supabase (upsert based on recap_id)
+        const { error: scriptError } = await supabase
+          .from("daily_recap_scripts")
+          .upsert({
+            recap_id: scriptData.recap_id,
+            user_id: scriptData.user_id,
+            script_text: scriptData.script,
+          }, { onConflict: "recap_id" });
+          
+        if (scriptError) {
+          console.error(`❌ Failed to save script to DB:`, scriptError);
+        } else {
+          console.log(`💾 Script saved to daily_recap_scripts table`);
+        }
+      }
+    } catch (bgError) {
+      console.error("❌ Background script generation failed:", bgError);
+    }
   });
   
 
