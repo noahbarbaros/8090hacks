@@ -174,18 +174,12 @@ export default function ChatSidebar({ isOpen, onClose, teamId, channelId }: Chat
     }
   };
 
-  if (!isOpen) return null;
-
   return (
-    <>
-      {/* Backdrop */}
-      <div
-        className="fixed inset-0 bg-black bg-opacity-30 z-40"
-        onClick={onClose}
-        aria-hidden="true"
-      />
-      {/* Sidebar */}
-      <div className="fixed right-0 top-0 h-full w-96 bg-white shadow-2xl z-50 flex flex-col border-l border-gray-200">
+    <div 
+      className={`fixed right-0 top-0 h-full w-96 bg-white shadow-2xl z-50 flex flex-col border-l border-gray-200 transform transition-transform duration-300 ease-in-out ${
+        isOpen ? 'translate-x-0' : 'translate-x-full'
+      }`}
+    >
       {/* Header */}
       <div className="flex items-center justify-between p-4 border-b border-gray-200 bg-gradient-to-r from-blue-600 to-blue-700 text-white">
         <div className="flex items-center space-x-2">
@@ -296,7 +290,6 @@ export default function ChatSidebar({ isOpen, onClose, teamId, channelId }: Chat
         </p>
       </div>
     </div>
-    </>
   );
 }
 

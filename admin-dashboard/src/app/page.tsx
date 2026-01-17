@@ -353,14 +353,6 @@ export default function AdminDashboard() {
     setNotificationStatus(null);
 
     try {
-      // First, generate the standup script
-      const script = await generateStandupScript();
-      
-      if (script) {
-        // Show the script modal
-        setShowScriptModal(true);
-      }
-
       // Send the meet link to Slack
       const message = `🎥 Stand Up Meeting\n\nJoin the stand up meeting here: ${meetUrl}`;
       
@@ -385,23 +377,16 @@ export default function AdminDashboard() {
       // Mark as sent
       setSentStandUpLinks((prev) => new Set(prev).add(slackUserId));
       
-      if (!script) {
-        setNotificationStatus({
-          type: "success",
-          message: `Stand up link sent to ${name}! (No recaps found to generate script)`,
-        });
-      }
+      // Redirect admin to meet page with autoplay
+      window.location.href = `${meetUrl}&autoplay=true`;
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : "Failed to send stand up link";
       setNotificationStatus({
         type: "error",
         message: errorMessage,
       });
-    } finally {
       setSendingStandUp(null);
-      if (!showScriptModal) {
-        setTimeout(() => setNotificationStatus(null), 3000);
-      }
+      setTimeout(() => setNotificationStatus(null), 3000);
     }
   };
 
@@ -421,14 +406,6 @@ export default function AdminDashboard() {
 
     setSendingStandUpToAll(true);
     setNotificationStatus(null);
-
-    // First, generate the standup script
-    const script = await generateStandupScript();
-    
-    if (script) {
-      // Show the script modal
-      setShowScriptModal(true);
-    }
 
     let successCount = 0;
     let errorCount = 0;
@@ -462,17 +439,8 @@ export default function AdminDashboard() {
       }
     }
 
-    if (!script) {
-      setNotificationStatus({
-        type: successCount > 0 ? "success" : "error",
-        message: `Sent stand up link to ${successCount} member(s)${errorCount > 0 ? `, ${errorCount} failed` : ""} (No recaps found to generate script)`,
-      });
-    }
-
-    setSendingStandUpToAll(false);
-    if (!showScriptModal) {
-      setTimeout(() => setNotificationStatus(null), 5000);
-    }
+    // Redirect admin to meet page with autoplay
+    window.location.href = `${meetUrl}&autoplay=true`;
   };
 
   const copyToClipboard = async () => {
